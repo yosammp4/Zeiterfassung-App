@@ -4,32 +4,190 @@
 // STATE
 // ============================================================
 
-var DATA = { customers: [], projects: [], timeEntries: [], activeTimer: null };
+var DATA = { customers: [], projects: [], timeEntries: [], activeTimer: null, ts: 0 };
 var currentView = 'dashboard';
 var currentParams = {};
 var timerInterval = null;
 
-function loadData() {
+function loadLocal() {
   try {
     var s = localStorage.getItem('ze_data');
     if (s) {
       var d = JSON.parse(s);
-      DATA.customers = d.customers || [];
-      DATA.projects = d.projects || [];
+      DATA.customers  = d.customers  || [];
+      DATA.projects   = d.projects   || [];
       DATA.timeEntries = d.timeEntries || [];
       DATA.activeTimer = d.activeTimer || null;
+      DATA.ts = d.ts || 0;
     }
-  } catch (e) { console.error('Load error', e); }
+  } catch (e) { console.error('loadLocal:', e); }
+}
+
+function saveLocal() {
+  try { localStorage.setItem('ze_data', JSON.stringify(DATA)); } catch (e) {}
 }
 
 function saveData() {
-  try {
-    localStorage.setItem('ze_data', JSON.stringify(DATA));
-  } catch (e) { console.error('Save error', e); }
+  saveLocal();
+  saveRemote();
 }
 
 function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+// ============================================================
+// FIREBASE SYNC
+// ============================================================
+
+var db = null;
+var syncUnsub = null;
+var SYNC_CODE = localStorage.getItem('ze_synccode') || '';
+var syncStatus = 'offline'; // offline | connecting | synced | error
+var ignoringOwnWrite = false;
+
+function isFirebaseConfigured() {
+  var cfg = window.FIREBASE_CONFIG;
+  return cfg && cfg.apiKey && cfg.apiKey !== 'DEIN_API_KEY';
+}
+
+function initFirebase() {
+  if (!isFirebaseConfigured()) { syncStatus = 'offline'; return; }
+  try {
+    if (!firebase.apps || !firebase.apps.length) {
+      firebase.initializeApp(window.FIREBASE_CONFIG);
+    }
+    db = firebase.firestore();
+    db.enablePersistence({ synchronizeTabs: true }).catch(function() {});
+
+    if (!SYNC_CODE) {
+      SYNC_CODE = genSyncCode();
+      localStorage.setItem('ze_synccode', SYNC_CODE);
+    }
+    connectSync();
+  } catch (e) {
+    console.error('Firebase init:', e);
+    syncStatus = 'error';
+    updateSyncDots();
+  }
+}
+
+function genSyncCode() {
+  var chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+  var c = '';
+  for (var i = 0; i < 8; i++) c += chars[Math.floor(Math.random() * chars.length)];
+  return c;
+}
+
+function connectSync() {
+  if (!db || !SYNC_CODE) return;
+  if (syncUnsub) { syncUnsub(); syncUnsub = null; }
+
+  syncStatus = 'connecting';
+  updateSyncDots();
+
+  var ref = db.collection('ze').doc(SYNC_CODE);
+
+  syncUnsub = ref.onSnapshot(
+    { includeMetadataChanges: true },
+    function(doc) {
+      // Skip snapshots caused by our own pending writes
+      if (doc.metadata.hasPendingWrites) {
+        syncStatus = 'synced';
+        updateSyncDots();
+        return;
+      }
+
+      syncStatus = 'synced';
+      updateSyncDots();
+
+      if (doc.exists) {
+        var remote = doc.data();
+        var remoteTs = remote.ts || 0;
+
+        if (remoteTs > DATA.ts) {
+          // Remote is newer → apply
+          DATA.customers   = remote.customers   || [];
+          DATA.projects    = remote.projects    || [];
+          DATA.timeEntries = remote.timeEntries || [];
+          DATA.activeTimer = remote.activeTimer !== undefined ? remote.activeTimer : null;
+          DATA.ts = remoteTs;
+          saveLocal();
+          render();
+          showToast('Daten synchronisiert');
+        }
+      } else {
+        // No remote document yet → push our local data
+        saveRemote();
+      }
+    },
+    function(err) {
+      console.error('Sync listener:', err);
+      syncStatus = 'error';
+      updateSyncDots();
+    }
+  );
+}
+
+function saveRemote() {
+  if (!db || !SYNC_CODE) return;
+  DATA.ts = Date.now();
+  saveLocal(); // keep ts in sync locally too
+  db.collection('ze').doc(SYNC_CODE).set({
+    customers:   DATA.customers,
+    projects:    DATA.projects,
+    timeEntries: DATA.timeEntries,
+    activeTimer: DATA.activeTimer !== undefined ? DATA.activeTimer : null,
+    ts: DATA.ts
+  }).catch(function(e) {
+    console.error('saveRemote:', e);
+    syncStatus = 'error';
+    updateSyncDots();
+  });
+}
+
+function updateSyncDots() {
+  var labels = {
+    offline:    'Sync nicht eingerichtet',
+    connecting: 'Verbinde mit Firebase…',
+    synced:     'Synchronisiert ✓',
+    error:      'Sync-Fehler – Einstellungen prüfen'
+  };
+  document.querySelectorAll('.sync-dot').forEach(function(el) {
+    el.className = 'sync-dot sync-' + syncStatus;
+    el.title = labels[syncStatus] || '';
+  });
+  // also update status dot inside settings modal if open
+  document.querySelectorAll('.sync-status-dot').forEach(function(el) {
+    el.className = 'sync-status-dot ' + syncStatus;
+  });
+  document.querySelectorAll('.sync-status-text').forEach(function(el) {
+    el.textContent = labels[syncStatus] || '';
+  });
+}
+
+function applySyncCode(newCode) {
+  newCode = (newCode || '').trim().toLowerCase();
+  if (!newCode) return;
+  SYNC_CODE = newCode;
+  localStorage.setItem('ze_synccode', SYNC_CODE);
+  if (db) {
+    connectSync();
+    showToast('Sync-Code gesetzt: ' + SYNC_CODE);
+  } else {
+    showToast('Firebase nicht eingerichtet – Code gespeichert');
+  }
+  hideModal();
+  render();
+}
+
+function copySyncCode() {
+  if (!SYNC_CODE) return;
+  navigator.clipboard.writeText(SYNC_CODE).then(function() {
+    showToast('Code kopiert: ' + SYNC_CODE);
+  }).catch(function() {
+    showToast(SYNC_CODE);
+  });
 }
 
 // ============================================================
@@ -41,8 +199,8 @@ function navigate(view, params) {
   currentParams = params || {};
   render();
   document.querySelectorAll('.nav-item').forEach(function(btn) {
-    var base = ['dashboard','kunden','projekte','zeiten','berichte'];
-    btn.classList.toggle('active', btn.dataset.view === view && base.indexOf(view) !== -1);
+    var roots = ['dashboard','kunden','projekte','zeiten','berichte'];
+    btn.classList.toggle('active', btn.dataset.view === view && roots.indexOf(view) !== -1);
   });
   document.getElementById('content').scrollTop = 0;
 }
@@ -56,9 +214,9 @@ function render() {
   timerInterval = null;
 
   var content = document.getElementById('content');
-  var addBtn = document.getElementById('add-btn');
+  var addBtn  = document.getElementById('add-btn');
   var backBtn = document.getElementById('back-btn');
-  var title = document.getElementById('page-title');
+  var title   = document.getElementById('page-title');
 
   addBtn.classList.remove('hidden');
   addBtn.onclick = null;
@@ -119,6 +277,7 @@ function render() {
 
   attachListeners();
   if (DATA.activeTimer) startTimerDisplay();
+  updateSyncDots();
 }
 
 // ============================================================
@@ -152,8 +311,7 @@ function typClass(t) { return { dreh: 'type-dreh', schnitt: 'type-schnitt', plan
 function stundensatzOf(proj) {
   if (!proj) return 0;
   if (proj.stundensatz && parseFloat(proj.stundensatz) > 0) return parseFloat(proj.stundensatz);
-  var gb = parseFloat(proj.gesamtbetrag);
-  var gs = parseFloat(proj.geplanteStunden);
+  var gb = parseFloat(proj.gesamtbetrag), gs = parseFloat(proj.geplanteStunden);
   if (gb > 0 && gs > 0) return gb / gs;
   return 0;
 }
@@ -161,24 +319,25 @@ function stundensatzOf(proj) {
 function projStats(projektId) {
   var proj = DATA.projects.find(function(p) { return p.id === projektId; });
   var ss = stundensatzOf(proj);
-  var stats = { total: 0, dreh: 0, schnitt: 0, plan: 0, cost: 0 };
+  var st = { total: 0, dreh: 0, schnitt: 0, plan: 0, cost: 0 };
   DATA.timeEntries.filter(function(e) { return e.projektId === projektId; }).forEach(function(e) {
     var m = parseFloat(e.dauer) || 0;
-    stats.total += m;
-    if (e.typ === 'dreh') stats.dreh += m;
-    if (e.typ === 'schnitt') stats.schnitt += m;
-    if (e.typ === 'plan') stats.plan += m;
-    stats.cost += (m / 60) * ss;
+    st.total += m;
+    if (e.typ === 'dreh')    st.dreh    += m;
+    if (e.typ === 'schnitt') st.schnitt += m;
+    if (e.typ === 'plan')    st.plan    += m;
+    st.cost += (m / 60) * ss;
   });
-  return stats;
-}
-
-function entryCost(entry) {
-  var proj = DATA.projects.find(function(p) { return p.id === entry.projektId; });
-  return (parseFloat(entry.dauer) || 0) / 60 * stundensatzOf(proj);
+  return st;
 }
 
 function entryDate(e) { return e.startTime || e.datum || ''; }
+
+function esc(str) {
+  return String(str || '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
 
 // ============================================================
 // VIEWS
@@ -190,13 +349,12 @@ function renderDashboard() {
 
   var todayMins = 0, weekMins = 0;
   DATA.timeEntries.forEach(function(e) {
-    var d = new Date(entryDate(e));
-    var m = parseFloat(e.dauer) || 0;
+    var d = new Date(entryDate(e)), m = parseFloat(e.dauer) || 0;
     if (d.toDateString() === today) todayMins += m;
     if (d >= weekStart) weekMins += m;
   });
 
-  var activeProjekte = DATA.projects.filter(function(p) { return p.status !== 'abgeschlossen'; });
+  var active = DATA.projects.filter(function(p) { return p.status !== 'abgeschlossen'; });
 
   var timerHtml = '';
   if (DATA.activeTimer) {
@@ -212,44 +370,39 @@ function renderDashboard() {
     '</div>';
   }
 
-  var quickHtml = '';
-  if (activeProjekte.length === 0) {
-    quickHtml = '<div class="empty-state"><div class="empty-icon">🎬</div><p>Noch keine Projekte.</p><p class="hint">Lege einen Kunden und ein Projekt an.</p></div>';
-  } else {
-    quickHtml = '<div style="display:flex;flex-direction:column;gap:10px">' +
-      activeProjekte.slice(0, 4).map(function(proj) {
-        var kd = DATA.customers.find(function(c) { return c.id === proj.kundeId; });
-        return '<div class="card project-quick-card">' +
-          '<div class="project-quick-info">' +
-            '<div class="project-name">' + esc(proj.name) + '</div>' +
-            '<div class="project-customer">' + esc(kd ? kd.name : '–') + '</div>' +
-          '</div>' +
-          '<div class="type-buttons">' +
-            '<button class="type-btn type-btn-dreh" onclick="startTimer(\'' + proj.id + '\',\'dreh\')">▶ Dreh</button>' +
-            '<button class="type-btn type-btn-schnitt" onclick="startTimer(\'' + proj.id + '\',\'schnitt\')">▶ Schnitt</button>' +
-            '<button class="type-btn type-btn-plan" onclick="startTimer(\'' + proj.id + '\',\'plan\')">▶ Plan</button>' +
-          '</div>' +
-        '</div>';
-      }).join('') +
-    '</div>';
-  }
+  var quickHtml = active.length === 0
+    ? '<div class="empty-state"><div class="empty-icon">🎬</div><p>Noch keine Projekte.</p><p class="hint">Lege zuerst einen Kunden und ein Projekt an.</p></div>'
+    : '<div style="display:flex;flex-direction:column;gap:10px">' +
+        active.slice(0, 4).map(function(proj) {
+          var kd = DATA.customers.find(function(c) { return c.id === proj.kundeId; });
+          return '<div class="card project-quick-card">' +
+            '<div class="project-quick-info">' +
+              '<div class="project-name">' + esc(proj.name) + '</div>' +
+              '<div class="project-customer">' + esc(kd ? kd.name : '–') + '</div>' +
+            '</div>' +
+            '<div class="type-buttons">' +
+              '<button class="type-btn type-btn-dreh" onclick="startTimer(\'' + proj.id + '\',\'dreh\')">▶ Dreh</button>' +
+              '<button class="type-btn type-btn-schnitt" onclick="startTimer(\'' + proj.id + '\',\'schnitt\')">▶ Schnitt</button>' +
+              '<button class="type-btn type-btn-plan" onclick="startTimer(\'' + proj.id + '\',\'plan\')">▶ Plan</button>' +
+            '</div>' +
+          '</div>';
+        }).join('') +
+      '</div>';
 
-  var recent = DATA.timeEntries.slice().sort(function(a, b) {
-    return new Date(entryDate(b)) - new Date(entryDate(a));
-  }).slice(0, 5);
+  var recent = DATA.timeEntries.slice()
+    .sort(function(a, b) { return new Date(entryDate(b)) - new Date(entryDate(a)); })
+    .slice(0, 5);
 
   return '<div class="view-content">' +
     timerHtml +
     '<div class="stats-grid">' +
       '<div class="stat-card"><div class="stat-value">' + fmtDur(todayMins) + '</div><div class="stat-label">Heute</div></div>' +
       '<div class="stat-card"><div class="stat-value">' + fmtDur(weekMins) + '</div><div class="stat-label">Diese Woche</div></div>' +
-      '<div class="stat-card"><div class="stat-value">' + activeProjekte.length + '</div><div class="stat-label">Projekte</div></div>' +
+      '<div class="stat-card"><div class="stat-value">' + active.length + '</div><div class="stat-label">Projekte</div></div>' +
       '<div class="stat-card"><div class="stat-value">' + DATA.customers.length + '</div><div class="stat-label">Kunden</div></div>' +
     '</div>' +
-    '<div class="section-title">Schnellstart</div>' +
-    quickHtml +
-    '<div class="section-title">Letzte Einträge</div>' +
-    renderEntryList(recent) +
+    '<div class="section-title">Schnellstart</div>' + quickHtml +
+    '<div class="section-title">Letzte Einträge</div>' + renderEntryList(recent) +
   '</div>';
 }
 
@@ -270,8 +423,8 @@ function renderKunden() {
           '<div class="list-item-subtitle">' + pz + ' Projekt' + (pz !== 1 ? 'e' : '') + '</div>' +
         '</div>' +
         '<div class="list-item-actions">' +
-          '<button class="icon-btn-small" data-action="edit-kunde" data-id="' + k.id + '" title="Bearbeiten">✎</button>' +
-          '<button class="icon-btn-small delete-btn" data-action="del-kunde" data-id="' + k.id + '" title="Löschen">×</button>' +
+          '<button class="icon-btn-small" data-action="edit-kunde" data-id="' + k.id + '">✎</button>' +
+          '<button class="icon-btn-small delete-btn" data-action="del-kunde" data-id="' + k.id + '">×</button>' +
           '<span class="list-item-arrow">›</span>' +
         '</div>' +
       '</div>';
@@ -281,15 +434,14 @@ function renderKunden() {
 
 function renderKundeDetail(id) {
   var k = DATA.customers.find(function(c) { return c.id === id; });
-  if (!k) return '<div class="view-content"><div class="empty-state">Kunde nicht gefunden.</div></div>';
+  if (!k) return '<div class="view-content"><div class="empty-state">Nicht gefunden.</div></div>';
   var projekte = DATA.projects.filter(function(p) { return p.kundeId === id; });
-
   return '<div class="view-content">' +
     '<div class="card">' +
       '<div class="detail-row"><span class="detail-label">Name</span><span>' + esc(k.name) + '</span></div>' +
-      (k.email ? '<div class="detail-row"><span class="detail-label">E-Mail</span><a href="mailto:' + esc(k.email) + '">' + esc(k.email) + '</a></div>' : '') +
+      (k.email   ? '<div class="detail-row"><span class="detail-label">E-Mail</span><a href="mailto:' + esc(k.email) + '">' + esc(k.email) + '</a></div>' : '') +
       (k.telefon ? '<div class="detail-row"><span class="detail-label">Telefon</span><a href="tel:' + esc(k.telefon) + '">' + esc(k.telefon) + '</a></div>' : '') +
-      (k.notiz ? '<div class="detail-row"><span class="detail-label">Notiz</span><span>' + esc(k.notiz) + '</span></div>' : '') +
+      (k.notiz   ? '<div class="detail-row"><span class="detail-label">Notiz</span><span>' + esc(k.notiz) + '</span></div>' : '') +
     '</div>' +
     '<div class="section-title">Projekte</div>' +
     (projekte.length === 0
@@ -300,20 +452,17 @@ function renderKundeDetail(id) {
 }
 
 function renderProjekte() {
-  var filterKId = currentParams.kundeId || '';
-  var list = filterKId
-    ? DATA.projects.filter(function(p) { return p.kundeId === filterKId; })
-    : DATA.projects;
+  var fk = currentParams.kundeId || '';
+  var list = fk ? DATA.projects.filter(function(p) { return p.kundeId === fk; }) : DATA.projects;
 
-  var filterHtml = '';
-  if (DATA.customers.length > 0) {
-    filterHtml = '<div class="filter-bar"><select id="kunde-filter" onchange="currentParams.kundeId=this.value||\'\';">' +
-      '<option value="">Alle Kunden</option>' +
-      DATA.customers.map(function(c) {
-        return '<option value="' + c.id + '"' + (filterKId === c.id ? ' selected' : '') + '>' + esc(c.name) + '</option>';
-      }).join('') +
-    '</select></div>';
-  }
+  var filterHtml = DATA.customers.length > 0
+    ? '<div class="filter-bar"><select id="kunde-filter">' +
+        '<option value="">Alle Kunden</option>' +
+        DATA.customers.map(function(c) {
+          return '<option value="' + c.id + '"' + (fk === c.id ? ' selected' : '') + '>' + esc(c.name) + '</option>';
+        }).join('') +
+      '</select></div>'
+    : '';
 
   if (list.length === 0) {
     return '<div class="view-content">' + filterHtml +
@@ -322,7 +471,6 @@ function renderProjekte() {
       '<button class="btn btn-primary" onclick="showModal(\'projekt\',{})"' + (DATA.customers.length === 0 ? ' disabled' : '') + '>Projekt anlegen</button>' +
     '</div></div>';
   }
-
   return '<div class="view-content">' + filterHtml +
     '<div class="list">' + list.map(renderProjektItem).join('') + '</div>' +
   '</div>';
@@ -334,7 +482,6 @@ function renderProjektItem(proj) {
   var budget = parseFloat(proj.gesamtbetrag) || 0;
   var pct = budget > 0 ? Math.min(100, (st.cost / budget) * 100) : 0;
   var ss = stundensatzOf(proj);
-
   var budgetHtml = '';
   if (budget > 0) {
     var cls = pct >= 90 ? 'danger' : pct >= 70 ? 'warning' : '';
@@ -343,7 +490,6 @@ function renderProjektItem(proj) {
   } else if (ss > 0) {
     budgetHtml = '<div class="rate-text">' + fmtEur(ss) + '/h · ' + fmtEur(st.cost) + ' gesamt</div>';
   }
-
   return '<div class="list-item" onclick="navigate(\'projekt-detail\',{id:\'' + proj.id + '\'})">' +
     '<div class="list-item-content">' +
       '<div class="list-item-title">' + esc(proj.name) + '</div>' +
@@ -351,8 +497,8 @@ function renderProjektItem(proj) {
       budgetHtml +
     '</div>' +
     '<div class="list-item-actions">' +
-      '<button class="icon-btn-small" data-action="edit-projekt" data-id="' + proj.id + '" title="Bearbeiten">✎</button>' +
-      '<button class="icon-btn-small delete-btn" data-action="del-projekt" data-id="' + proj.id + '" title="Löschen">×</button>' +
+      '<button class="icon-btn-small" data-action="edit-projekt" data-id="' + proj.id + '">✎</button>' +
+      '<button class="icon-btn-small delete-btn" data-action="del-projekt" data-id="' + proj.id + '">×</button>' +
       '<span class="list-item-arrow">›</span>' +
     '</div>' +
   '</div>';
@@ -360,31 +506,25 @@ function renderProjektItem(proj) {
 
 function renderProjektDetail(id) {
   var proj = DATA.projects.find(function(p) { return p.id === id; });
-  if (!proj) return '<div class="view-content"><div class="empty-state">Projekt nicht gefunden.</div></div>';
-
+  if (!proj) return '<div class="view-content"><div class="empty-state">Nicht gefunden.</div></div>';
   var k = DATA.customers.find(function(c) { return c.id === proj.kundeId; });
   var st = projStats(id);
   var ss = stundensatzOf(proj);
   var budget = parseFloat(proj.gesamtbetrag) || 0;
   var pct = budget > 0 ? Math.min(100, (st.cost / budget) * 100) : 0;
 
-  var timerHtml = '';
-  if (DATA.activeTimer && DATA.activeTimer.projektId === id) {
-    timerHtml = '<div class="card active-timer-card">' +
-      '<div class="timer-running-indicator"></div>' +
-      '<span class="type-badge ' + typClass(DATA.activeTimer.typ) + '">' + typLabel(DATA.activeTimer.typ) + '</span>' +
-      '<div id="timer-display" class="timer-display">0:00:00</div>' +
-      '<button class="btn btn-danger btn-full" onclick="stopTimer()">Stoppen</button>' +
-    '</div>';
-  } else {
-    timerHtml = '<div class="card">' +
-      '<div class="type-buttons type-buttons-big">' +
+  var timerHtml = DATA.activeTimer && DATA.activeTimer.projektId === id
+    ? '<div class="card active-timer-card">' +
+        '<div class="timer-running-indicator"></div>' +
+        '<span class="type-badge ' + typClass(DATA.activeTimer.typ) + '">' + typLabel(DATA.activeTimer.typ) + '</span>' +
+        '<div id="timer-display" class="timer-display">0:00:00</div>' +
+        '<button class="btn btn-danger btn-full" onclick="stopTimer()">Stoppen</button>' +
+      '</div>'
+    : '<div class="card"><div class="type-buttons type-buttons-big">' +
         '<button class="type-btn type-btn-dreh" onclick="startTimer(\'' + id + '\',\'dreh\')">▶ Dreh</button>' +
         '<button class="type-btn type-btn-schnitt" onclick="startTimer(\'' + id + '\',\'schnitt\')">▶ Schnitt</button>' +
         '<button class="type-btn type-btn-plan" onclick="startTimer(\'' + id + '\',\'plan\')">▶ Plan</button>' +
-      '</div>' +
-    '</div>';
-  }
+      '</div></div>';
 
   var entries = DATA.timeEntries.filter(function(e) { return e.projektId === id; })
     .sort(function(a, b) { return new Date(entryDate(b)) - new Date(entryDate(a)); });
@@ -408,15 +548,13 @@ function renderProjektDetail(id) {
       '<div class="stat-card"><div class="stat-value">' + fmtDur(st.total) + '</div><div class="stat-label">Gesamt</div></div>' +
     '</div>' +
     timerHtml +
-    '<div class="section-title">Zeiteinträge</div>' +
-    renderEntryList(entries, true) +
+    '<div class="section-title">Zeiteinträge</div>' + renderEntryList(entries, true) +
   '</div>';
 }
 
 function renderZeiten() {
   var today = new Date().toISOString().split('T')[0];
   var fd = currentParams.filterDate || today;
-
   var list = DATA.timeEntries.filter(function(e) {
     return (entryDate(e) || '').split('T')[0] === fd;
   }).sort(function(a, b) { return new Date(entryDate(b)) - new Date(entryDate(a)); });
@@ -445,27 +583,23 @@ function renderZeiten() {
   '</div>';
 }
 
-function renderEntryList(entries, showTime) {
+function renderEntryList(entries, showProject) {
   if (entries.length === 0) return '<div class="empty-state"><p>Keine Einträge vorhanden.</p></div>';
   return '<div class="entries-list">' +
     entries.map(function(e) {
       var proj = DATA.projects.find(function(p) { return p.id === e.projektId; });
+      var cost = (parseFloat(e.dauer) || 0) / 60 * stundensatzOf(proj);
       var ss = stundensatzOf(proj);
-      var cost = (parseFloat(e.dauer) || 0) / 60 * ss;
-      var metaStr = showTime
-        ? fmtDate(entryDate(e)) + (fmtTime(entryDate(e)) ? ' ' + fmtTime(entryDate(e)) : '')
-        : (fmtDate(entryDate(e)) + (fmtTime(entryDate(e)) ? ' · ' + fmtTime(entryDate(e)) : ''));
-
       return '<div class="entry-card">' +
         '<span class="type-badge ' + typClass(e.typ) + '">' + typLabel(e.typ) + '</span>' +
         '<div class="entry-info">' +
           (proj ? '<div class="entry-project">' + esc(proj.name) + '</div>' : '') +
-          '<div class="entry-meta">' + metaStr + '</div>' +
+          '<div class="entry-meta">' + fmtDate(entryDate(e)) + (fmtTime(entryDate(e)) ? ' · ' + fmtTime(entryDate(e)) : '') + '</div>' +
           '<div class="entry-duration">' + fmtDur(e.dauer) + '</div>' +
           (e.notiz ? '<div class="entry-note">' + esc(e.notiz) + '</div>' : '') +
         '</div>' +
         (ss > 0 ? '<div class="entry-cost">' + fmtEur(cost) + '</div>' : '') +
-        '<button class="icon-btn-small delete-btn" data-action="del-entry" data-id="' + e.id + '" title="Löschen">×</button>' +
+        '<button class="icon-btn-small delete-btn" data-action="del-entry" data-id="' + e.id + '">×</button>' +
       '</div>';
     }).join('') +
   '</div>';
@@ -475,37 +609,28 @@ function renderBerichte() {
   var now = new Date();
   var firstDay = new Date(now.getFullYear(), now.getMonth(), 1);
   var fromDate = currentParams.fromDate || firstDay.toISOString().split('T')[0];
-  var toDate = currentParams.toDate || now.toISOString().split('T')[0];
-
-  var from = new Date(fromDate);
-  var to = new Date(toDate + 'T23:59:59');
+  var toDate   = currentParams.toDate   || now.toISOString().split('T')[0];
+  var from = new Date(fromDate), to = new Date(toDate + 'T23:59:59');
 
   var filtered = DATA.timeEntries.filter(function(e) {
-    var d = new Date(entryDate(e));
-    return d >= from && d <= to;
+    var d = new Date(entryDate(e)); return d >= from && d <= to;
   });
 
   var totals = { dreh: 0, schnitt: 0, plan: 0, total: 0, cost: 0 };
   var byProj = {};
-
   filtered.forEach(function(e) {
     var m = parseFloat(e.dauer) || 0;
     var proj = DATA.projects.find(function(p) { return p.id === e.projektId; });
-    var ss = stundensatzOf(proj);
-    var c = (m / 60) * ss;
-
-    totals.total += m;
-    totals.cost += c;
-    if (e.typ === 'dreh') totals.dreh += m;
+    var c = (m / 60) * stundensatzOf(proj);
+    totals.total += m; totals.cost += c;
+    if (e.typ === 'dreh')    totals.dreh    += m;
     if (e.typ === 'schnitt') totals.schnitt += m;
-    if (e.typ === 'plan') totals.plan += m;
-
-    if (!byProj[e.projektId]) byProj[e.projektId] = { dreh: 0, schnitt: 0, plan: 0, total: 0, cost: 0 };
-    byProj[e.projektId].total += m;
-    byProj[e.projektId].cost += c;
-    if (e.typ === 'dreh') byProj[e.projektId].dreh += m;
+    if (e.typ === 'plan')    totals.plan    += m;
+    if (!byProj[e.projektId]) byProj[e.projektId] = { dreh:0, schnitt:0, plan:0, total:0, cost:0 };
+    byProj[e.projektId].total += m; byProj[e.projektId].cost += c;
+    if (e.typ === 'dreh')    byProj[e.projektId].dreh    += m;
     if (e.typ === 'schnitt') byProj[e.projektId].schnitt += m;
-    if (e.typ === 'plan') byProj[e.projektId].plan += m;
+    if (e.typ === 'plan')    byProj[e.projektId].plan    += m;
   });
 
   var projRows = Object.keys(byProj).map(function(pid) {
@@ -562,23 +687,18 @@ function startTimer(projektId, typ) {
   render();
 }
 
-function stopTimer() {
-  finishTimer(true);
-}
+function stopTimer() { finishTimer(true); }
 
 function finishTimer(save) {
   if (!DATA.activeTimer) return;
   if (save) {
-    var start = new Date(DATA.activeTimer.startTime);
-    var end = new Date();
-    var dauer = Math.round((end - start) / 60000);
-    if (dauer < 1) dauer = 1;
+    var dauer = Math.max(1, Math.round((Date.now() - new Date(DATA.activeTimer.startTime)) / 60000));
     DATA.timeEntries.push({
       id: genId(),
       projektId: DATA.activeTimer.projektId,
       typ: DATA.activeTimer.typ,
       startTime: DATA.activeTimer.startTime,
-      endTime: end.toISOString(),
+      endTime: new Date().toISOString(),
       datum: DATA.activeTimer.startTime,
       dauer: dauer,
       notiz: '',
@@ -586,8 +706,7 @@ function finishTimer(save) {
     });
   }
   DATA.activeTimer = null;
-  clearInterval(timerInterval);
-  timerInterval = null;
+  clearInterval(timerInterval); timerInterval = null;
   saveData();
   render();
 }
@@ -598,10 +717,7 @@ function startTimerDisplay() {
     var el = document.getElementById('timer-display');
     if (!el) { clearInterval(timerInterval); timerInterval = null; return; }
     var secs = Math.floor((Date.now() - new Date(DATA.activeTimer.startTime)) / 1000);
-    var h = Math.floor(secs / 3600);
-    var m = Math.floor((secs % 3600) / 60);
-    var s = secs % 60;
-    el.textContent = h + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+    el.textContent = Math.floor(secs/3600) + ':' + String(Math.floor((secs%3600)/60)).padStart(2,'0') + ':' + String(secs%60).padStart(2,'0');
   }
   update();
   timerInterval = setInterval(update, 1000);
@@ -615,61 +731,70 @@ function showModal(type, params) {
   var overlay = document.getElementById('modal-overlay');
   var mc = document.getElementById('modal-content');
 
-  if (type === 'kunde') mc.innerHTML = buildKundeForm(params);
-  else if (type === 'projekt') mc.innerHTML = buildProjektForm(params);
+  if      (type === 'kunde')      mc.innerHTML = buildKundeForm(params);
+  else if (type === 'projekt')    mc.innerHTML = buildProjektForm(params);
   else if (type === 'zeiteintrag') mc.innerHTML = buildZeitForm(params);
+  else if (type === 'settings')   mc.innerHTML = buildSettingsModal();
 
   overlay.classList.remove('hidden');
 
   var form = mc.querySelector('form');
   if (form) {
-    form.onsubmit = function(e) {
-      e.preventDefault();
-      handleSubmit(type, form, params);
-    };
+    form.onsubmit = function(e) { e.preventDefault(); handleSubmit(type, form, params); };
+
     if (type === 'zeiteintrag') {
-      var von = form.querySelector('[name=vonZeit]');
-      var bis = form.querySelector('[name=bisZeit]');
-      var dur = form.querySelector('[name=dauer]');
+      var von = form.querySelector('[name=vonZeit]'), bis = form.querySelector('[name=bisZeit]'), dur = form.querySelector('[name=dauer]');
       function calcDur() {
         if (von && bis && von.value && bis.value) {
-          var parts = function(t) { return t.split(':').map(Number); };
-          var vm = parts(von.value); var bm = parts(bis.value);
-          var diff = (bm[0]*60+bm[1]) - (vm[0]*60+vm[1]);
+          var vp = von.value.split(':').map(Number), bp = bis.value.split(':').map(Number);
+          var diff = (bp[0]*60+bp[1]) - (vp[0]*60+vp[1]);
           if (diff > 0 && dur) dur.value = diff;
         }
       }
       von && von.addEventListener('change', calcDur);
       bis && bis.addEventListener('change', calcDur);
     }
+
     if (type === 'projekt') {
-      var gb = form.querySelector('[name=gesamtbetrag]');
-      var gs = form.querySelector('[name=geplanteStunden]');
-      var ss = form.querySelector('[name=stundensatz]');
-      var preview = form.querySelector('#ss-preview');
-      function updatePreview() {
+      var gb = form.querySelector('[name=gesamtbetrag]'), gs = form.querySelector('[name=geplanteStunden]'),
+          ss = form.querySelector('[name=stundensatz]'), preview = form.querySelector('#ss-preview');
+      function updPrev() {
         if (!preview) return;
-        var gbv = parseFloat(gb && gb.value);
-        var gsv = parseFloat(gs && gs.value);
-        var ssv = parseFloat(ss && ss.value);
-        if (ssv > 0) {
-          preview.textContent = 'Stundensatz: ' + fmtEur(ssv) + '/h (direkt)';
-          preview.classList.add('visible');
-        } else if (gbv > 0 && gsv > 0) {
-          preview.textContent = 'Stundensatz: ' + fmtEur(gbv / gsv) + '/h (' + fmtEur(gbv) + ' ÷ ' + gsv + 'h)';
-          preview.classList.add('visible');
-        } else {
-          preview.classList.remove('visible');
-        }
+        var gbv = parseFloat(gb && gb.value), gsv = parseFloat(gs && gs.value), ssv = parseFloat(ss && ss.value);
+        if (ssv > 0) { preview.textContent = 'Stundensatz: ' + fmtEur(ssv) + '/h (direkt)'; preview.classList.add('visible'); }
+        else if (gbv > 0 && gsv > 0) { preview.textContent = 'Stundensatz: ' + fmtEur(gbv/gsv) + '/h'; preview.classList.add('visible'); }
+        else { preview.classList.remove('visible'); }
       }
-      gb && gb.addEventListener('input', updatePreview);
-      gs && gs.addEventListener('input', updatePreview);
-      ss && ss.addEventListener('input', updatePreview);
-      updatePreview();
+      gb && gb.addEventListener('input', updPrev);
+      gs && gs.addEventListener('input', updPrev);
+      ss && ss.addEventListener('input', updPrev);
+      updPrev();
     }
   }
 
-  mc.querySelector('.btn-cancel') && (mc.querySelector('.btn-cancel').onclick = hideModal);
+  // Settings modal buttons
+  if (type === 'settings') {
+    var applyBtn = mc.querySelector('#apply-sync-code');
+    if (applyBtn) {
+      applyBtn.onclick = function() {
+        var inp = document.getElementById('new-sync-code-input');
+        if (inp) applySyncCode(inp.value);
+      };
+    }
+    var genBtn = mc.querySelector('#gen-new-code');
+    if (genBtn) {
+      genBtn.onclick = function() {
+        var code = genSyncCode();
+        document.getElementById('new-sync-code-input').value = code;
+        applySyncCode(code);
+      };
+    }
+    var copyBtn = mc.querySelector('#copy-sync-code');
+    if (copyBtn) copyBtn.onclick = copySyncCode;
+  }
+
+  var cancelBtn = mc.querySelector('.btn-cancel');
+  if (cancelBtn) cancelBtn.onclick = hideModal;
   overlay.onclick = function(e) { if (e.target === overlay) hideModal(); };
 }
 
@@ -677,34 +802,45 @@ function hideModal() {
   document.getElementById('modal-overlay').classList.add('hidden');
 }
 
+// ============================================================
+// FORM BUILDERS
+// ============================================================
+
+function field(type, name, label, val, ph, req, extra) {
+  return '<div class="form-group"><label>' + label + '</label>' +
+    '<input type="' + type + '" name="' + name + '" value="' + esc(val || '') + '" placeholder="' + esc(ph || '') + '"' +
+    (req ? ' required' : '') + (extra ? ' ' + extra : '') + '>' +
+  '</div>';
+}
+
 function buildKundeForm(p) {
   var k = p && p.id ? DATA.customers.find(function(c) { return c.id === p.id; }) : null;
   return '<div class="modal-header"><h2>' + (k ? 'Kunde bearbeiten' : 'Neuer Kunde') + '</h2></div>' +
     '<form>' +
       (k ? '<input type="hidden" name="id" value="' + k.id + '">' : '') +
-      field('text', 'name', 'Name *', k ? k.name : '', 'Firmen- oder Kontaktname', true) +
-      field('email', 'email', 'E-Mail', k ? k.email : '', 'email@beispiel.de') +
-      field('tel', 'telefon', 'Telefon', k ? k.telefon : '', '+49 ...') +
-      '<div class="form-group"><label>Notiz</label><textarea name="notiz" placeholder="Optional...">' + esc(k ? k.notiz || '' : '') + '</textarea></div>' +
+      field('text',  'name',    'Name *',    k ? k.name    : '', 'Firmen- oder Kontaktname', true) +
+      field('email', 'email',   'E-Mail',    k ? k.email   : '', 'email@beispiel.de') +
+      field('tel',   'telefon', 'Telefon',   k ? k.telefon : '', '+49 …') +
+      '<div class="form-group"><label>Notiz</label><textarea name="notiz" placeholder="Optional…">' + esc(k ? k.notiz || '' : '') + '</textarea></div>' +
       '<div class="form-actions"><button type="button" class="btn btn-cancel">Abbrechen</button><button type="submit" class="btn btn-primary">Speichern</button></div>' +
     '</form>';
 }
 
 function buildProjektForm(p) {
   var proj = p && p.id ? DATA.projects.find(function(pr) { return pr.id === p.id; }) : null;
-  var preKId = p && p.kundeId ? p.kundeId : (proj ? proj.kundeId : '');
+  var preK = p && p.kundeId ? p.kundeId : (proj ? proj.kundeId : '');
   var opts = DATA.customers.map(function(c) {
-    return '<option value="' + c.id + '"' + (preKId === c.id ? ' selected' : '') + '>' + esc(c.name) + '</option>';
+    return '<option value="' + c.id + '"' + (preK === c.id ? ' selected' : '') + '>' + esc(c.name) + '</option>';
   }).join('');
   return '<div class="modal-header"><h2>' + (proj ? 'Projekt bearbeiten' : 'Neues Projekt') + '</h2></div>' +
     '<form>' +
       (proj ? '<input type="hidden" name="id" value="' + proj.id + '">' : '') +
       field('text', 'name', 'Projektname *', proj ? proj.name : '', 'z.B. Werbefilm XY', true) +
       '<div class="form-group"><label>Kunde *</label><select name="kundeId" required><option value="">– Kunde wählen –</option>' + opts + '</select></div>' +
-      '<div class="form-group"><label>Beschreibung</label><textarea name="beschreibung" placeholder="Optional...">' + esc(proj ? proj.beschreibung || '' : '') + '</textarea></div>' +
-      field('number', 'gesamtbetrag', 'Gesamtbudget (€)', proj ? proj.gesamtbetrag : '', 'z.B. 5000', false, 'min="0" step="0.01"') +
-      field('number', 'geplanteStunden', 'Geplante Stunden', proj ? proj.geplanteStunden : '', 'z.B. 40', false, 'min="0" step="0.5"') +
-      field('number', 'stundensatz', 'Direkter Stundensatz (€/h)', proj ? proj.stundensatz : '', 'z.B. 125 – hat Vorrang', false, 'min="0" step="0.01"') +
+      '<div class="form-group"><label>Beschreibung</label><textarea name="beschreibung" placeholder="Optional…">' + esc(proj ? proj.beschreibung || '' : '') + '</textarea></div>' +
+      field('number', 'gesamtbetrag',    'Gesamtbudget (€)',          proj ? proj.gesamtbetrag    : '', 'z.B. 5000', false, 'min="0" step="0.01"') +
+      field('number', 'geplanteStunden', 'Geplante Stunden',          proj ? proj.geplanteStunden : '', 'z.B. 40',   false, 'min="0" step="0.5"') +
+      field('number', 'stundensatz',     'Oder: Stundensatz (€/h)',   proj ? proj.stundensatz     : '', 'z.B. 125 – hat Vorrang', false, 'min="0" step="0.01"') +
       '<div id="ss-preview" class="stundensatz-preview"></div>' +
       '<div class="form-actions"><button type="button" class="btn btn-cancel">Abbrechen</button><button type="submit" class="btn btn-primary">Speichern</button></div>' +
     '</form>';
@@ -713,7 +849,7 @@ function buildProjektForm(p) {
 function buildZeitForm(p) {
   var preId = p && p.projektId ? p.projektId : '';
   var today = new Date().toISOString().split('T')[0];
-  var nowT = new Date().toTimeString().slice(0, 5);
+  var nowT  = new Date().toTimeString().slice(0, 5);
   var opts = DATA.projects.map(function(pr) {
     var k = DATA.customers.find(function(c) { return c.id === pr.kundeId; });
     return '<option value="' + pr.id + '"' + (preId === pr.id ? ' selected' : '') + '>' + esc(pr.name) + (k ? ' (' + esc(k.name) + ')' : '') + '</option>';
@@ -727,22 +863,76 @@ function buildZeitForm(p) {
           '<label class="type-radio schnitt"><input type="radio" name="typ" value="schnitt"> Schnitt</label>' +
           '<label class="type-radio plan"><input type="radio" name="typ" value="plan"> Planung</label>' +
         '</div></div>' +
-      field('date', 'datum', 'Datum *', today, '', true) +
-      '<div class="form-row">' +
-        field('time', 'vonZeit', 'Von', nowT, '') +
-        field('time', 'bisZeit', 'Bis', '', '') +
-      '</div>' +
+      field('date', 'datum',   'Datum *', today, '', true) +
+      '<div class="form-row">' + field('time', 'vonZeit', 'Von', nowT, '') + field('time', 'bisZeit', 'Bis', '', '') + '</div>' +
       field('number', 'dauer', 'Dauer (Minuten) *', '', 'z.B. 90', true, 'min="1"') +
       '<div class="form-group"><label>Notiz</label><textarea name="notiz" placeholder="Was wurde gemacht?"></textarea></div>' +
       '<div class="form-actions"><button type="button" class="btn btn-cancel">Abbrechen</button><button type="submit" class="btn btn-primary">Speichern</button></div>' +
     '</form>';
 }
 
-function field(type, name, label, val, ph, req, extra) {
-  return '<div class="form-group">' +
-    '<label>' + label + '</label>' +
-    '<input type="' + type + '" name="' + name + '" value="' + esc(val || '') + '" placeholder="' + esc(ph || '') + '"' +
-    (req ? ' required' : '') + (extra ? ' ' + extra : '') + '>' +
+function buildSettingsModal() {
+  var configured = isFirebaseConfigured();
+  var statusLabels = {
+    offline: 'Nicht verbunden', connecting: 'Verbinde…', synced: 'Synchronisiert', error: 'Fehler'
+  };
+  var statusSubs = {
+    offline:    configured ? 'Sync-Code eingeben zum Verbinden' : 'Firebase noch nicht eingerichtet',
+    connecting: 'Verbindung wird aufgebaut…',
+    synced:     'Alle Daten sind aktuell',
+    error:      'Einstellungen oder Internetverbindung prüfen'
+  };
+
+  return '<div class="modal-header"><h2>Synchronisation</h2></div>' +
+  '<div class="settings-body">' +
+
+    // Status
+    '<div class="settings-section">' +
+      '<div class="settings-label">Status</div>' +
+      '<div class="sync-status-row">' +
+        '<div class="sync-status-dot ' + syncStatus + '"></div>' +
+        '<div>' +
+          '<div class="sync-status-text">' + statusLabels[syncStatus] + '</div>' +
+          '<div class="sync-status-sub">' + statusSubs[syncStatus] + '</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>' +
+
+    // Warning if not configured
+    (!configured
+      ? '<div class="firebase-not-configured">' +
+          '<div class="warn-title">⚠ Firebase nicht eingerichtet</div>' +
+          '<div class="warn-text">Öffne die Datei <strong>config.js</strong> und trage deine Firebase-Daten ein.<br>Die Anleitung steht als Kommentar direkt in der Datei.</div>' +
+        '</div>'
+      : ''
+    ) +
+
+    // Current sync code
+    '<div class="settings-section">' +
+      '<div class="settings-label">Dein Sync-Code</div>' +
+      '<div class="sync-code-box">' +
+        '<div class="sync-code-value">' + esc(SYNC_CODE || '–') + '</div>' +
+        (SYNC_CODE ? '<button class="copy-btn" id="copy-sync-code">Kopieren</button>' : '') +
+      '</div>' +
+      '<div class="form-hint">Gib diesen Code auf deinem anderen Gerät ein, um die Daten zu synchronisieren.</div>' +
+    '</div>' +
+
+    '<div class="settings-divider"></div>' +
+
+    // Enter a code from another device
+    '<div class="settings-section">' +
+      '<div class="settings-label">Code von anderem Gerät eingeben</div>' +
+      '<div class="sync-code-input-row">' +
+        '<input type="text" id="new-sync-code-input" placeholder="z.B. abc3def7" maxlength="20" value="' + esc(SYNC_CODE) + '" autocomplete="off" autocorrect="off" spellcheck="false">' +
+        '<button class="btn btn-primary btn-sm" id="apply-sync-code">OK</button>' +
+      '</div>' +
+      '<div class="form-hint">Achtung: Vorhandene Daten werden mit den Daten des anderen Geräts zusammengeführt.</div>' +
+    '</div>' +
+
+    '<button class="btn btn-ghost btn-full" id="gen-new-code" style="font-size:13px">Neuen Sync-Code generieren</button>' +
+
+    '<button type="button" class="btn btn-cancel btn-full" onclick="hideModal()">Schließen</button>' +
+
   '</div>';
 }
 
@@ -751,8 +941,7 @@ function field(type, name, label, val, ph, req, extra) {
 // ============================================================
 
 function handleSubmit(type, form, params) {
-  var fd = new FormData(form);
-  var d = {};
+  var fd = new FormData(form), d = {};
   fd.forEach(function(v, k) { d[k] = v; });
 
   if (type === 'kunde') {
@@ -771,24 +960,14 @@ function handleSubmit(type, form, params) {
     }
   } else if (type === 'zeiteintrag') {
     if (d.vonZeit && d.bisZeit) {
-      var vp = d.vonZeit.split(':').map(Number);
-      var bp = d.bisZeit.split(':').map(Number);
+      var vp = d.vonZeit.split(':').map(Number), bp = d.bisZeit.split(':').map(Number);
       var diff = (bp[0]*60+bp[1]) - (vp[0]*60+vp[1]);
       if (diff > 0) d.dauer = diff;
     }
     var st = d.datum && d.vonZeit
       ? new Date(d.datum + 'T' + d.vonZeit).toISOString()
       : new Date(d.datum + 'T00:00').toISOString();
-    DATA.timeEntries.push({
-      id: genId(),
-      projektId: d.projektId,
-      typ: d.typ,
-      startTime: st,
-      datum: st,
-      dauer: parseFloat(d.dauer) || 0,
-      notiz: d.notiz || '',
-      manuell: true
-    });
+    DATA.timeEntries.push({ id: genId(), projektId: d.projektId, typ: d.typ, startTime: st, datum: st, dauer: parseFloat(d.dauer)||0, notiz: d.notiz||'', manuell: true });
   }
 
   saveData();
@@ -803,20 +982,15 @@ function handleSubmit(type, form, params) {
 function attachListeners() {
   var content = document.getElementById('content');
   content.addEventListener('click', handleContentClick, { once: true });
-
   var kf = document.getElementById('kunde-filter');
-  if (kf) kf.addEventListener('change', function() {
-    currentParams.kundeId = this.value || '';
-    render();
-  });
+  if (kf) kf.addEventListener('change', function() { currentParams.kundeId = this.value || ''; render(); });
 }
 
 function handleContentClick(e) {
   var btn = e.target.closest('[data-action]');
   if (!btn) return;
   e.stopPropagation();
-  var action = btn.dataset.action;
-  var id = btn.dataset.id;
+  var action = btn.dataset.action, id = btn.dataset.id;
 
   if (action === 'del-entry') {
     if (confirm('Eintrag löschen?')) {
@@ -827,7 +1001,7 @@ function handleContentClick(e) {
     showModal('kunde', { id: id });
   } else if (action === 'del-kunde') {
     var pz = DATA.projects.filter(function(p) { return p.kundeId === id; }).length;
-    if (confirm('Kunden löschen?' + (pz > 0 ? '\nHinweis: ' + pz + ' Projekt(e) bleiben erhalten.' : ''))) {
+    if (confirm('Kunden löschen?' + (pz > 0 ? '\n' + pz + ' Projekt(e) bleiben erhalten.' : ''))) {
       DATA.customers = DATA.customers.filter(function(c) { return c.id !== id; });
       saveData(); render();
     }
@@ -836,7 +1010,7 @@ function handleContentClick(e) {
   } else if (action === 'del-projekt') {
     var ez = DATA.timeEntries.filter(function(e) { return e.projektId === id; }).length;
     if (confirm('Projekt und ' + ez + ' Zeiteintrag/Einträge löschen?')) {
-      DATA.projects = DATA.projects.filter(function(p) { return p.id !== id; });
+      DATA.projects    = DATA.projects.filter(function(p) { return p.id !== id; });
       DATA.timeEntries = DATA.timeEntries.filter(function(e) { return e.projektId !== id; });
       saveData(); render();
     }
@@ -849,45 +1023,39 @@ function handleContentClick(e) {
 
 function exportCSV(from, to) {
   var f = new Date(from), t = new Date(to + 'T23:59:59');
-  var rows = [['Datum', 'Uhrzeit', 'Typ', 'Projekt', 'Kunde', 'Minuten', 'Stunden', 'Kosten (€)', 'Notiz']];
+  var rows = [['Datum','Uhrzeit','Typ','Projekt','Kunde','Minuten','Stunden','Kosten (€)','Notiz']];
   DATA.timeEntries
     .filter(function(e) { var d = new Date(entryDate(e)); return d >= f && d <= t; })
     .sort(function(a, b) { return new Date(entryDate(a)) - new Date(entryDate(b)); })
     .forEach(function(e) {
       var proj = DATA.projects.find(function(p) { return p.id === e.projektId; });
       var k = proj ? DATA.customers.find(function(c) { return c.id === proj.kundeId; }) : null;
-      var ss = stundensatzOf(proj);
-      var mins = parseFloat(e.dauer) || 0;
-      rows.push([
-        fmtDate(entryDate(e)),
-        fmtTime(entryDate(e)),
-        typLabel(e.typ),
-        proj ? proj.name : '',
-        k ? k.name : '',
-        mins,
-        (mins / 60).toFixed(2),
-        ss > 0 ? (mins / 60 * ss).toFixed(2) : '',
-        e.notiz || ''
-      ]);
+      var ss = stundensatzOf(proj), m = parseFloat(e.dauer) || 0;
+      rows.push([fmtDate(entryDate(e)), fmtTime(entryDate(e)), typLabel(e.typ), proj?proj.name:'', k?k.name:'', m, (m/60).toFixed(2), ss > 0 ? (m/60*ss).toFixed(2) : '', e.notiz||'']);
     });
-  var csv = rows.map(function(r) {
-    return r.map(function(c) { return '"' + String(c).replace(/"/g, '""') + '"'; }).join(';');
-  }).join('\r\n');
+  var csv = rows.map(function(r) { return r.map(function(c) { return '"' + String(c).replace(/"/g,'""') + '"'; }).join(';'); }).join('\r\n');
   var blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
   var url = URL.createObjectURL(blob);
   var a = document.createElement('a');
-  a.href = url;
-  a.download = 'zeiterfassung_' + from + '_' + to + '.csv';
-  a.click();
+  a.href = url; a.download = 'zeiterfassung_' + from + '_' + to + '.csv'; a.click();
   setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
 }
 
 // ============================================================
-// SECURITY HELPER
+// TOAST
 // ============================================================
 
-function esc(str) {
-  return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+function showToast(msg) {
+  var t = document.getElementById('toast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'toast'; t.className = 'toast';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._timer);
+  t._timer = setTimeout(function() { t.classList.remove('show'); }, 2200);
 }
 
 // ============================================================
@@ -895,28 +1063,29 @@ function esc(str) {
 // ============================================================
 
 function init() {
-  loadData();
+  loadLocal();
 
   document.querySelectorAll('.nav-item').forEach(function(btn) {
-    btn.addEventListener('click', function() {
-      currentParams = {};
-      navigate(btn.dataset.view);
-    });
+    btn.addEventListener('click', function() { currentParams = {}; navigate(btn.dataset.view); });
   });
 
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(function(e) { console.warn('SW:', e); });
   }
 
+  initFirebase();
   navigate('dashboard');
 }
 
-window.navigate = navigate;
-window.startTimer = startTimer;
-window.stopTimer = stopTimer;
-window.showModal = showModal;
-window.hideModal = hideModal;
-window.exportCSV = exportCSV;
+// Globals for inline handlers
+window.navigate     = navigate;
+window.startTimer   = startTimer;
+window.stopTimer    = stopTimer;
+window.showModal    = showModal;
+window.hideModal    = hideModal;
+window.exportCSV    = exportCSV;
+window.copySyncCode = copySyncCode;
+window.applySyncCode = applySyncCode;
 window.currentParams = currentParams;
 
 document.addEventListener('DOMContentLoaded', init);
