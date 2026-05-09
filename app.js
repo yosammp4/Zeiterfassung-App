@@ -310,10 +310,14 @@ function typClass(t) { return { dreh: 'type-dreh', schnitt: 'type-schnitt', plan
 
 function stundensatzOf(proj) {
   if (!proj) return 0;
-  if (proj.stundensatz && parseFloat(proj.stundensatz) > 0) return parseFloat(proj.stundensatz);
-  var gb = parseFloat(proj.gesamtbetrag), gs = parseFloat(proj.geplanteStunden);
-  if (gb > 0 && gs > 0) return gb / gs;
-  return 0;
+  var gb = parseFloat(proj.gesamtbetrag);
+  if (!gb || gb <= 0) return 0;
+  var totalMins = DATA.timeEntries
+    .filter(function(e) { return e.projektId === proj.id; })
+    .reduce(function(s, e) { return s + (parseFloat(e.dauer) || 0); }, 0);
+  var totalH = totalMins / 60;
+  if (totalH <= 0) return 0;
+  return gb / totalH;
 }
 
 function projStats(projektId) {
@@ -533,7 +537,11 @@ function renderProjektDetail(id) {
     '<div class="card">' +
       '<div class="detail-row"><span class="detail-label">Kunde</span><span>' + esc(k ? k.name : '–') + '</span></div>' +
       (proj.beschreibung ? '<div class="detail-row"><span class="detail-label">Beschreibung</span><span>' + esc(proj.beschreibung) + '</span></div>' : '') +
-      (ss > 0 ? '<div class="detail-row"><span class="detail-label">Stundensatz</span><span>' + fmtEur(ss) + '/h</span></div>' : '') +
+      (budget > 0
+        ? (ss > 0
+          ? '<div class="detail-row"><span class="detail-label">Stundensatz</span><span>' + fmtEur(ss) + '/h <small style="color:var(--text-2);font-weight:400">(aktuell)</small></span></div>'
+          : '<div class="detail-row"><span class="detail-label">Stundensatz</span><span style="color:var(--text-2);font-size:13px">– noch keine Stunden getrackt</span></div>')
+        : '') +
       (budget > 0
         ? '<div class="detail-row"><span class="detail-label">Budget</span><span>' + fmtEur(budget) + '</span></div>' +
           '<div class="budget-bar large"><div class="budget-bar-fill ' + (pct >= 90 ? 'danger' : pct >= 70 ? 'warning' : '') + '" style="width:' + pct + '%"></div></div>' +
@@ -755,21 +763,6 @@ function showModal(type, params) {
       bis && bis.addEventListener('change', calcDur);
     }
 
-    if (type === 'projekt') {
-      var gb = form.querySelector('[name=gesamtbetrag]'), gs = form.querySelector('[name=geplanteStunden]'),
-          ss = form.querySelector('[name=stundensatz]'), preview = form.querySelector('#ss-preview');
-      function updPrev() {
-        if (!preview) return;
-        var gbv = parseFloat(gb && gb.value), gsv = parseFloat(gs && gs.value), ssv = parseFloat(ss && ss.value);
-        if (ssv > 0) { preview.textContent = 'Stundensatz: ' + fmtEur(ssv) + '/h (direkt)'; preview.classList.add('visible'); }
-        else if (gbv > 0 && gsv > 0) { preview.textContent = 'Stundensatz: ' + fmtEur(gbv/gsv) + '/h'; preview.classList.add('visible'); }
-        else { preview.classList.remove('visible'); }
-      }
-      gb && gb.addEventListener('input', updPrev);
-      gs && gs.addEventListener('input', updPrev);
-      ss && ss.addEventListener('input', updPrev);
-      updPrev();
-    }
   }
 
   // Settings modal buttons
@@ -838,10 +831,8 @@ function buildProjektForm(p) {
       field('text', 'name', 'Projektname *', proj ? proj.name : '', 'z.B. Werbefilm XY', true) +
       '<div class="form-group"><label>Kunde *</label><select name="kundeId" required><option value="">– Kunde wählen –</option>' + opts + '</select></div>' +
       '<div class="form-group"><label>Beschreibung</label><textarea name="beschreibung" placeholder="Optional…">' + esc(proj ? proj.beschreibung || '' : '') + '</textarea></div>' +
-      field('number', 'gesamtbetrag',    'Gesamtbudget (€)',          proj ? proj.gesamtbetrag    : '', 'z.B. 5000', false, 'min="0" step="0.01"') +
-      field('number', 'geplanteStunden', 'Geplante Stunden',          proj ? proj.geplanteStunden : '', 'z.B. 40',   false, 'min="0" step="0.5"') +
-      field('number', 'stundensatz',     'Oder: Stundensatz (€/h)',   proj ? proj.stundensatz     : '', 'z.B. 125 – hat Vorrang', false, 'min="0" step="0.01"') +
-      '<div id="ss-preview" class="stundensatz-preview"></div>' +
+      field('number', 'gesamtbetrag', 'Gesamtbudget (€)', proj ? proj.gesamtbetrag : '', 'z.B. 5000', false, 'min="0" step="0.01"') +
+      '<div class="form-hint" style="margin-top:-8px">Der Stundensatz wird automatisch aus Budget ÷ getrackten Stunden berechnet.</div>' +
       '<div class="form-actions"><button type="button" class="btn btn-cancel">Abbrechen</button><button type="submit" class="btn btn-primary">Speichern</button></div>' +
     '</form>';
 }
