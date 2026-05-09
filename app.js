@@ -44,7 +44,7 @@ var db = null;
 var syncUnsub = null;
 var SYNC_CODE = localStorage.getItem('ze_synccode') || '';
 var syncStatus = 'offline'; // offline | connecting | synced | error
-var ignoringOwnWrite = false;
+var firstSyncDone = false;  // sicherstellt dass Cloud-Daten beim ersten Verbinden immer geladen werden
 
 function isFirebaseConfigured() {
   var cfg = window.FIREBASE_CONFIG;
@@ -83,6 +83,7 @@ function connectSync() {
   if (!db || !SYNC_CODE) return;
   if (syncUnsub) { syncUnsub(); syncUnsub = null; }
 
+  firstSyncDone = false;
   syncStatus = 'connecting';
   updateSyncDots();
 
@@ -105,8 +106,11 @@ function connectSync() {
         var remote = doc.data();
         var remoteTs = remote.ts || 0;
 
-        if (remoteTs > DATA.ts) {
-          // Remote is newer → apply
+        // Beim ersten Sync IMMER die Cloud-Daten laden (schützt vor Datenverlust bei App-Updates).
+        // Danach nur übernehmen wenn Cloud neuer ist als lokaler Stand.
+        var shouldApply = !firstSyncDone || remoteTs > DATA.ts;
+
+        if (shouldApply) {
           DATA.customers   = remote.customers   || [];
           DATA.projects    = remote.projects    || [];
           DATA.timeEntries = remote.timeEntries || [];
@@ -114,10 +118,12 @@ function connectSync() {
           DATA.ts = remoteTs;
           saveLocal();
           render();
-          showToast('Daten synchronisiert');
+          if (firstSyncDone) showToast('Daten synchronisiert');
         }
+        firstSyncDone = true;
       } else {
-        // No remote document yet → push our local data
+        // Kein Cloud-Dokument → lokale Daten hochladen
+        firstSyncDone = true;
         saveRemote();
       }
     },
@@ -1164,36 +1170,37 @@ function processCSVImport(text) {
     var cols = parseCSVRow(lines[i]);
     if (cols.length < 6) { skipped++; continue; }
 
-    var datumStr   = cols[iDatum]   || '';   // "TT.MM.JJ"
-    var uhrzeitStr = cols[iUhrzeit] || '00:00'; // "HH:MM"
-    var typStr     = cols[iTyp]     || '';
-    var projektName = cols[iProjekt] || '';
-    var minuten    = parseFloat(cols[iMinuten]) || 0;
-    var notiz      = iNotiz >= 0 ? (cols[iNotiz] || '') : '';
+    var datumStr    = (cols[iDatum]   || '').trim();
+    var uhrzeitStr  = (cols[iUhrzeit] || '00:00').trim();
+    var typStr      = (cols[iTyp]     || '').trim();
+    var projektName = (cols[iProjekt] || '').trim();
+    var minuten     = parseFloat((cols[iMinuten] || '').replace(',', '.')) || 0;
+    var notiz       = iNotiz >= 0 ? (cols[iNotiz] || '').trim() : '';
 
     if (!datumStr || !typStr || !projektName || minuten <= 0) { skipped++; continue; }
 
     // Parse date "DD.MM.YY" or "DD.MM.YYYY"
     var dp = datumStr.split('.');
     if (dp.length < 3) { skipped++; continue; }
-    var year = dp[2].length === 2 ? '20' + dp[2] : dp[2];
-    var isoDate = year + '-' + dp[1].padStart(2,'0') + '-' + dp[0].padStart(2,'0');
-    var startTime = new Date(isoDate + 'T' + (uhrzeitStr || '00:00')).toISOString();
+    var year = dp[2].trim().length === 2 ? '20' + dp[2].trim() : dp[2].trim();
+    var isoDate = year + '-' + dp[1].trim().padStart(2,'0') + '-' + dp[0].trim().padStart(2,'0');
+    var timeStr = uhrzeitStr || '00:00';
+    var startTime = new Date(isoDate + 'T' + timeStr + ':00').toISOString();
 
-    // Find project by name
+    // Find project by name – trim both sides to handle trailing spaces in CSV
     var proj = DATA.projects.find(function(p) {
-      return p.name.toLowerCase() === projektName.toLowerCase();
+      return p.name.trim().toLowerCase() === projektName.toLowerCase();
     });
     if (!proj) { noProject++; continue; }
 
     var typ = TYP_REVERSE[typStr] || typStr.toLowerCase();
     if (['dreh','schnitt','plan'].indexOf(typ) < 0) { skipped++; continue; }
 
-    // Duplicate check: same project, typ, startTime and dauer
+    // Duplikat-Prüfung: gleicher Tag + Typ + Projekt + Dauer (±1 Min. Toleranz)
     var duplicate = DATA.timeEntries.some(function(e) {
       return e.projektId === proj.id &&
              e.typ === typ &&
-             Math.abs(parseFloat(e.dauer) - minuten) < 1 &&
+             Math.abs(parseFloat(e.dauer) - minuten) < 2 &&
              (entryDate(e) || '').slice(0,10) === isoDate;
     });
     if (duplicate) { skipped++; continue; }
