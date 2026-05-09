@@ -607,7 +607,8 @@ function renderEntryList(entries, showProject) {
           (e.notiz ? '<div class="entry-note">' + esc(e.notiz) + '</div>' : '') +
         '</div>' +
         (ss > 0 ? '<div class="entry-cost">' + fmtEur(cost) + '</div>' : '') +
-        '<button class="icon-btn-small delete-btn" data-action="del-entry" data-id="' + e.id + '">×</button>' +
+        '<button class="icon-btn-small" data-action="edit-entry" data-id="' + e.id + '" title="Bearbeiten">✎</button>' +
+        '<button class="icon-btn-small delete-btn" data-action="del-entry" data-id="' + e.id + '" title="Löschen">×</button>' +
       '</div>';
     }).join('') +
   '</div>';
@@ -677,7 +678,10 @@ function renderBerichte() {
     (totals.cost > 0 ? '<div class="total-cost-card"><span>Gesamtkosten</span><span>' + fmtEur(totals.cost) + '</span></div>' : '') +
     '<div class="section-title">Nach Projekt</div>' +
     (projRows ? '<div class="list">' + projRows + '</div>' : '<div class="empty-state"><p>Keine Einträge im Zeitraum.</p></div>') +
-    (filtered.length > 0 ? '<button class="export-btn" onclick="exportCSV(\'' + fromDate + '\',\'' + toDate + '\')">📥 Als CSV exportieren</button>' : '') +
+    '<div style="display:flex;gap:10px">' +
+      (filtered.length > 0 ? '<button class="export-btn" style="flex:1" onclick="exportCSV(\'' + fromDate + '\',\'' + toDate + '\')">📥 Exportieren</button>' : '') +
+      '<button class="export-btn" style="flex:1" onclick="importCSV()">📤 Importieren</button>' +
+    '</div>' +
   '</div>';
 }
 
@@ -739,10 +743,11 @@ function showModal(type, params) {
   var overlay = document.getElementById('modal-overlay');
   var mc = document.getElementById('modal-content');
 
-  if      (type === 'kunde')      mc.innerHTML = buildKundeForm(params);
-  else if (type === 'projekt')    mc.innerHTML = buildProjektForm(params);
-  else if (type === 'zeiteintrag') mc.innerHTML = buildZeitForm(params);
-  else if (type === 'settings')   mc.innerHTML = buildSettingsModal();
+  if      (type === 'kunde')           mc.innerHTML = buildKundeForm(params);
+  else if (type === 'projekt')         mc.innerHTML = buildProjektForm(params);
+  else if (type === 'zeiteintrag')     mc.innerHTML = buildZeitForm(params);
+  else if (type === 'zeiteintrag-edit') mc.innerHTML = buildZeitEditForm(params.id);
+  else if (type === 'settings')        mc.innerHTML = buildSettingsModal();
 
   overlay.classList.remove('hidden');
 
@@ -862,6 +867,50 @@ function buildZeitForm(p) {
     '</form>';
 }
 
+function buildZeitEditForm(entryId) {
+  var e = DATA.timeEntries.find(function(x) { return x.id === entryId; });
+  if (!e) return '<div class="modal-header"><h2>Nicht gefunden</h2></div>';
+
+  var d = new Date(entryDate(e));
+  var datumVal = d.toISOString().split('T')[0];
+  var vonVal   = d.toTimeString().slice(0, 5);
+
+  var opts = DATA.projects.map(function(pr) {
+    var k = DATA.customers.find(function(c) { return c.id === pr.kundeId; });
+    return '<option value="' + pr.id + '"' + (e.projektId === pr.id ? ' selected' : '') + '>' +
+      esc(pr.name) + (k ? ' (' + esc(k.name) + ')' : '') + '</option>';
+  }).join('');
+
+  function radioChecked(val) { return e.typ === val ? ' checked' : ''; }
+
+  return '<div class="modal-header"><h2>Eintrag bearbeiten</h2></div>' +
+    '<form>' +
+      '<input type="hidden" name="id" value="' + e.id + '">' +
+      '<div class="form-group"><label>Projekt *</label><select name="projektId" required>' +
+        '<option value="">– Projekt wählen –</option>' + opts +
+      '</select></div>' +
+      '<div class="form-group"><label>Typ *</label>' +
+        '<div class="type-selector">' +
+          '<label class="type-radio dreh"><input type="radio" name="typ" value="dreh"' + radioChecked('dreh') + ' required> Dreh</label>' +
+          '<label class="type-radio schnitt"><input type="radio" name="typ" value="schnitt"' + radioChecked('schnitt') + '> Schnitt</label>' +
+          '<label class="type-radio plan"><input type="radio" name="typ" value="plan"' + radioChecked('plan') + '> Planung</label>' +
+        '</div></div>' +
+      field('date',   'datum',   'Datum *',            datumVal, '', true) +
+      '<div class="form-row">' +
+        field('time', 'vonZeit', 'Von',                vonVal,   '') +
+        field('time', 'bisZeit', 'Bis',                '',       '') +
+      '</div>' +
+      field('number', 'dauer',   'Dauer (Minuten) *',  e.dauer,  'z.B. 90', true, 'min="1"') +
+      '<div class="form-group"><label>Notiz</label>' +
+        '<textarea name="notiz" placeholder="Was wurde gemacht?">' + esc(e.notiz || '') + '</textarea>' +
+      '</div>' +
+      '<div class="form-actions">' +
+        '<button type="button" class="btn btn-cancel">Abbrechen</button>' +
+        '<button type="submit" class="btn btn-primary">Speichern</button>' +
+      '</div>' +
+    '</form>';
+}
+
 function buildSettingsModal() {
   var configured = isFirebaseConfigured();
   var statusLabels = {
@@ -949,7 +998,7 @@ function handleSubmit(type, form, params) {
     } else {
       DATA.projects.push(Object.assign({ id: genId(), createdAt: new Date().toISOString(), status: 'aktiv' }, d));
     }
-  } else if (type === 'zeiteintrag') {
+  } else if (type === 'zeiteintrag' || type === 'zeiteintrag-edit') {
     if (d.vonZeit && d.bisZeit) {
       var vp = d.vonZeit.split(':').map(Number), bp = d.bisZeit.split(':').map(Number);
       var diff = (bp[0]*60+bp[1]) - (vp[0]*60+vp[1]);
@@ -958,7 +1007,18 @@ function handleSubmit(type, form, params) {
     var st = d.datum && d.vonZeit
       ? new Date(d.datum + 'T' + d.vonZeit).toISOString()
       : new Date(d.datum + 'T00:00').toISOString();
-    DATA.timeEntries.push({ id: genId(), projektId: d.projektId, typ: d.typ, startTime: st, datum: st, dauer: parseFloat(d.dauer)||0, notiz: d.notiz||'', manuell: true });
+    if (type === 'zeiteintrag-edit' && d.id) {
+      var idx = DATA.timeEntries.findIndex(function(e) { return e.id === d.id; });
+      if (idx >= 0) {
+        DATA.timeEntries[idx] = Object.assign({}, DATA.timeEntries[idx], {
+          projektId: d.projektId, typ: d.typ,
+          startTime: st, datum: st,
+          dauer: parseFloat(d.dauer) || 0, notiz: d.notiz || '', manuell: true
+        });
+      }
+    } else {
+      DATA.timeEntries.push({ id: genId(), projektId: d.projektId, typ: d.typ, startTime: st, datum: st, dauer: parseFloat(d.dauer)||0, notiz: d.notiz||'', manuell: true });
+    }
   }
 
   saveData();
@@ -983,7 +1043,9 @@ function handleContentClick(e) {
   e.stopPropagation();
   var action = btn.dataset.action, id = btn.dataset.id;
 
-  if (action === 'del-entry') {
+  if (action === 'edit-entry') {
+    showModal('zeiteintrag-edit', { id: id });
+  } else if (action === 'del-entry') {
     if (confirm('Eintrag löschen?')) {
       DATA.timeEntries = DATA.timeEntries.filter(function(en) { return en.id !== id; });
       saveData(); render();
@@ -1033,6 +1095,132 @@ function exportCSV(from, to) {
 }
 
 // ============================================================
+// IMPORT
+// ============================================================
+
+function importCSV() {
+  var input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.csv,text/csv';
+  input.onchange = function() {
+    var file = input.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function(ev) {
+      try {
+        processCSVImport(ev.target.result);
+      } catch (err) {
+        alert('Fehler beim Importieren: ' + err.message);
+      }
+    };
+    reader.readAsText(file, 'utf-8');
+  };
+  input.click();
+}
+
+function parseCSVRow(row) {
+  var cols = [], cur = '', inQ = false;
+  for (var i = 0; i < row.length; i++) {
+    var ch = row[i];
+    if (ch === '"') {
+      if (inQ && row[i+1] === '"') { cur += '"'; i++; }
+      else inQ = !inQ;
+    } else if (ch === ';' && !inQ) {
+      cols.push(cur); cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  cols.push(cur);
+  return cols;
+}
+
+// Reverse-map German type labels back to internal keys
+var TYP_REVERSE = { 'Dreh': 'dreh', 'Schnitt': 'schnitt', 'Planung': 'plan' };
+
+function processCSVImport(text) {
+  // Strip BOM if present
+  text = text.replace(/^﻿/, '');
+  var lines = text.split(/\r?\n/).filter(function(l) { return l.trim(); });
+  if (lines.length < 2) { alert('CSV ist leer oder hat kein gültiges Format.'); return; }
+
+  // Expected header: Datum;Uhrzeit;Typ;Projekt;Kunde;Minuten;Stunden;Kosten (€);Notiz
+  var header = parseCSVRow(lines[0]);
+  var iDatum   = header.indexOf('Datum');
+  var iUhrzeit = header.indexOf('Uhrzeit');
+  var iTyp     = header.indexOf('Typ');
+  var iProjekt = header.indexOf('Projekt');
+  var iMinuten = header.indexOf('Minuten');
+  var iNotiz   = header.indexOf('Notiz');
+
+  if (iDatum < 0 || iTyp < 0 || iProjekt < 0 || iMinuten < 0) {
+    alert('Ungültiges CSV-Format. Bitte nur Dateien importieren, die mit dieser App exportiert wurden.');
+    return;
+  }
+
+  var imported = 0, skipped = 0, noProject = 0;
+
+  for (var i = 1; i < lines.length; i++) {
+    var cols = parseCSVRow(lines[i]);
+    if (cols.length < 6) { skipped++; continue; }
+
+    var datumStr   = cols[iDatum]   || '';   // "TT.MM.JJ"
+    var uhrzeitStr = cols[iUhrzeit] || '00:00'; // "HH:MM"
+    var typStr     = cols[iTyp]     || '';
+    var projektName = cols[iProjekt] || '';
+    var minuten    = parseFloat(cols[iMinuten]) || 0;
+    var notiz      = iNotiz >= 0 ? (cols[iNotiz] || '') : '';
+
+    if (!datumStr || !typStr || !projektName || minuten <= 0) { skipped++; continue; }
+
+    // Parse date "DD.MM.YY" or "DD.MM.YYYY"
+    var dp = datumStr.split('.');
+    if (dp.length < 3) { skipped++; continue; }
+    var year = dp[2].length === 2 ? '20' + dp[2] : dp[2];
+    var isoDate = year + '-' + dp[1].padStart(2,'0') + '-' + dp[0].padStart(2,'0');
+    var startTime = new Date(isoDate + 'T' + (uhrzeitStr || '00:00')).toISOString();
+
+    // Find project by name
+    var proj = DATA.projects.find(function(p) {
+      return p.name.toLowerCase() === projektName.toLowerCase();
+    });
+    if (!proj) { noProject++; continue; }
+
+    var typ = TYP_REVERSE[typStr] || typStr.toLowerCase();
+    if (['dreh','schnitt','plan'].indexOf(typ) < 0) { skipped++; continue; }
+
+    // Duplicate check: same project, typ, startTime and dauer
+    var duplicate = DATA.timeEntries.some(function(e) {
+      return e.projektId === proj.id &&
+             e.typ === typ &&
+             Math.abs(parseFloat(e.dauer) - minuten) < 1 &&
+             (entryDate(e) || '').slice(0,10) === isoDate;
+    });
+    if (duplicate) { skipped++; continue; }
+
+    DATA.timeEntries.push({
+      id: genId(),
+      projektId: proj.id,
+      typ: typ,
+      startTime: startTime,
+      datum: startTime,
+      dauer: minuten,
+      notiz: notiz,
+      manuell: true
+    });
+    imported++;
+  }
+
+  saveData();
+  render();
+
+  var msg = imported + ' Einträge importiert';
+  if (skipped > 0)   msg += ' · ' + skipped + ' übersprungen';
+  if (noProject > 0) msg += ' · ' + noProject + ' Projekte nicht gefunden';
+  showToast(msg);
+}
+
+// ============================================================
 // TOAST
 // ============================================================
 
@@ -1069,13 +1257,14 @@ function init() {
 }
 
 // Globals for inline handlers
-window.navigate     = navigate;
-window.startTimer   = startTimer;
-window.stopTimer    = stopTimer;
-window.showModal    = showModal;
-window.hideModal    = hideModal;
-window.exportCSV    = exportCSV;
-window.copySyncCode = copySyncCode;
+window.navigate      = navigate;
+window.startTimer    = startTimer;
+window.stopTimer     = stopTimer;
+window.showModal     = showModal;
+window.hideModal     = hideModal;
+window.exportCSV     = exportCSV;
+window.importCSV     = importCSV;
+window.copySyncCode  = copySyncCode;
 window.applySyncCode = applySyncCode;
 window.currentParams = currentParams;
 
