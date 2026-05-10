@@ -1151,11 +1151,12 @@ function processCSVImport(text) {
   if (lines.length < 2) { alert('CSV ist leer oder hat kein gültiges Format.'); return; }
 
   // Expected header: Datum;Uhrzeit;Typ;Projekt;Kunde;Minuten;Stunden;Kosten (€);Notiz
-  var header = parseCSVRow(lines[0]);
+  var header = parseCSVRow(lines[0]).map(function(h) { return h.trim(); });
   var iDatum   = header.indexOf('Datum');
   var iUhrzeit = header.indexOf('Uhrzeit');
   var iTyp     = header.indexOf('Typ');
   var iProjekt = header.indexOf('Projekt');
+  var iKunde   = header.indexOf('Kunde');
   var iMinuten = header.indexOf('Minuten');
   var iNotiz   = header.indexOf('Notiz');
 
@@ -1164,7 +1165,7 @@ function processCSVImport(text) {
     return;
   }
 
-  var imported = 0, skipped = 0, noProject = 0;
+  var imported = 0, skipped = 0, createdKunden = 0, createdProjekte = 0;
 
   for (var i = 1; i < lines.length; i++) {
     var cols = parseCSVRow(lines[i]);
@@ -1174,6 +1175,7 @@ function processCSVImport(text) {
     var uhrzeitStr  = (cols[iUhrzeit] || '00:00').trim();
     var typStr      = (cols[iTyp]     || '').trim();
     var projektName = (cols[iProjekt] || '').trim();
+    var kundeName   = iKunde >= 0 ? (cols[iKunde] || '').trim() : '';
     var minuten     = parseFloat((cols[iMinuten] || '').replace(',', '.')) || 0;
     var notiz       = iNotiz >= 0 ? (cols[iNotiz] || '').trim() : '';
 
@@ -1187,16 +1189,39 @@ function processCSVImport(text) {
     var timeStr = uhrzeitStr || '00:00';
     var startTime = new Date(isoDate + 'T' + timeStr + ':00').toISOString();
 
-    // Find project by name – trim both sides to handle trailing spaces in CSV
-    var proj = DATA.projects.find(function(p) {
-      return p.name.trim().toLowerCase() === projektName.toLowerCase();
-    });
-    if (!proj) { noProject++; continue; }
-
     var typ = TYP_REVERSE[typStr] || typStr.toLowerCase();
     if (['dreh','schnitt','plan'].indexOf(typ) < 0) { skipped++; continue; }
 
-    // Duplikat-Prüfung: gleicher Tag + Typ + Projekt + Dauer (±1 Min. Toleranz)
+    // Kunden suchen oder automatisch anlegen
+    var kunde = null;
+    if (kundeName) {
+      kunde = DATA.customers.find(function(c) {
+        return c.name.trim().toLowerCase() === kundeName.toLowerCase();
+      });
+      if (!kunde) {
+        kunde = { id: genId(), name: kundeName, createdAt: new Date().toISOString() };
+        DATA.customers.push(kunde);
+        createdKunden++;
+      }
+    }
+
+    // Projekt suchen oder automatisch anlegen
+    var proj = DATA.projects.find(function(p) {
+      return p.name.trim().toLowerCase() === projektName.toLowerCase();
+    });
+    if (!proj) {
+      proj = {
+        id: genId(),
+        name: projektName,
+        kundeId: kunde ? kunde.id : '',
+        createdAt: new Date().toISOString(),
+        status: 'aktiv'
+      };
+      DATA.projects.push(proj);
+      createdProjekte++;
+    }
+
+    // Duplikat-Prüfung: gleicher Tag + Typ + Projekt + Dauer (±2 Min. Toleranz)
     var duplicate = DATA.timeEntries.some(function(e) {
       return e.projektId === proj.id &&
              e.typ === typ &&
@@ -1222,8 +1247,9 @@ function processCSVImport(text) {
   render();
 
   var msg = imported + ' Einträge importiert';
-  if (skipped > 0)   msg += ' · ' + skipped + ' übersprungen';
-  if (noProject > 0) msg += ' · ' + noProject + ' Projekte nicht gefunden';
+  if (createdKunden > 0)   msg += ' · ' + createdKunden + ' Kunden neu';
+  if (createdProjekte > 0) msg += ' · ' + createdProjekte + ' Projekte neu';
+  if (skipped > 0)         msg += ' · ' + skipped + ' übersprungen';
   showToast(msg);
 }
 
